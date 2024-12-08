@@ -13,11 +13,14 @@
 #include <fstream>
 #include <winreg.h>
 #include <winternl.h>
+#include <wbemidl.h>
+#include <comdef.h>
 
 #pragma comment(lib, "Ntdll.lib")
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Iphlpapi.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "wbemuuid.lib")
 
 typedef NTSTATUS(NTAPI *NtQuerySystemInformation_t)(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
@@ -27,6 +30,9 @@ typedef NTSTATUS(NTAPI *NtQuerySystemInformation_t)(
 
 static NtQuerySystemInformation_t NtQuerySystemInformationFunc =
     (NtQuerySystemInformation_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
+
+static IWbemServices *g_pSvc = nullptr;
+static IWbemLocator *g_pLoc = nullptr;
 
 std::vector<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION> prevInfo;
 std::vector<double> perCoreUsage;
@@ -41,6 +47,94 @@ bool initCoreData()
     if (NtQuerySystemInformationFunc(SystemProcessorPerformanceInformation, prevInfo.data(), (ULONG)(count * sizeof(SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION)), &len) != 0)
         return false;
     return true;
+}
+
+bool initWMI()
+{
+    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+    if (FAILED(hr))
+        return false;
+
+    hr = CoInitializeSecurity(
+        NULL,
+        -1,                          // COM negotiates service
+        NULL,                        // Authentication services
+        NULL,                        // Reserved
+        RPC_C_AUTHN_LEVEL_DEFAULT,   // Default authentication
+        RPC_C_IMP_LEVEL_IMPERSONATE, // Default Impersonation
+        NULL,                        // Authentication info
+        (DWORD)EOAC_NONE,            // Capabilities
+        NULL);
+    if (FAILED(hr))
+        return false;
+
+    hr = CoCreateInstance(CLSID_WbemLocator, 0,
+                          CLSCTX_INPROC_SERVER,
+                          IID_IWbemLocator, (LPVOID *)&g_pLoc);
+    if (FAILED(hr))
+        return false;
+
+    hr = g_pLoc->ConnectServer(
+        _bstr_t(L"ROOT\\CIMV2"), // WMI namespace
+        NULL,
+        NULL,
+        0,
+        NULL,
+        0,
+        0,
+        &g_pSvc);
+    if (FAILED(hr))
+        return false;
+
+    hr = CoSetProxyBlanket(
+        g_pSvc,
+        RPC_C_AUTHN_WINNT,
+        RPC_C_AUTHZ_NONE,
+        NULL,
+        RPC_C_AUTHN_LEVEL_CALL,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        NULL,
+        EOAC_NONE);
+    if (FAILED(hr))
+        return false;
+
+    return true;
+}
+// NOT WORKING
+// TODO:
+DWORD getCurrentCpuFrequency()
+{
+    if (!g_pSvc)
+        return 0;
+
+    IEnumWbemClassObject *pEnumerator = NULL;
+    HRESULT hr = g_pSvc->ExecQuery(
+        bstr_t("WQL"),
+        bstr_t("SELECT CurrentClockSpeed FROM Win32_Processor"),
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+        NULL,
+        &pEnumerator);
+
+    DWORD frequency = 0;
+    if (SUCCEEDED(hr) && pEnumerator)
+{
+    IWbemClassObject *pObj = NULL;
+    ULONG retCount = 0;
+    if (pEnumerator->Next(WBEM_INFINITE, 1, &pObj, &retCount) == S_OK)
+    {
+        VARIANT vtProp;
+        VariantInit(&vtProp);
+        if (SUCCEEDED(pObj->Get(L"CurrentClockSpeed", 0, &vtProp, 0, 0)) && vtProp.vt == VT_UI4)
+        {
+            frequency = vtProp.ulVal; // frequency in MHz
+        }
+        VariantClear(&vtProp);
+        pObj->Release();
+    }
+    pEnumerator->Release();
+}
+
+    return frequency;
 }
 
 void getPerCoreCpuUsage(std::vector<double> &usageOut)
@@ -339,6 +433,8 @@ void statsThread()
         std::string cpuModel = getCpuModel();
         std::string lan = getLanIPv4();
 
+        //DWORD freq = getCurrentCpuFrequency();
+        //std::cout << "Current CPU speed (WMI): " << freq << " MHz" << std::endl;
         g_stats.cpuUsage = std::to_string(cpu);
         g_stats.hostname = host;
         g_stats.uptime_str = uptime;
@@ -375,16 +471,6 @@ void statsThread()
         DWORD mhz;
         DWORD size = sizeof(mhz);
 
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                          "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
-                          0, KEY_READ, &hKey) == ERROR_SUCCESS)
-        {
-            if (RegQueryValueExA(hKey, "~MHz", NULL, NULL, (LPBYTE)&mhz, &size) == ERROR_SUCCESS)
-            {
-                std::cout << "Current CPU speed: " << mhz << " MHz" << std::endl;
-            }
-            RegCloseKey(hKey);
-        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 }
@@ -457,7 +543,7 @@ std::string getAllNetworkInterfacesJSON()
     json << "]";
     return json.str();
 }
-// Example function to list all volumes and their usage
+// function to list all volumes and their usage
 std::string getAllDiskUsageJSON()
 {
     std::ostringstream json;
@@ -520,7 +606,7 @@ std::string getAllDiskUsageJSON()
     return json.str();
 }
 
-// Simple HTTP server on Windows
+// HTTP server
 void serveClient(SOCKET client)
 {
     char buffer[1024];
@@ -573,7 +659,12 @@ int main()
 {
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
-
+/*
+    if (!initWMI())
+    {
+        std::cerr << "Failed to init WMI" << std::endl;
+    }
+*/
     if (!initCoreData())
     {
         std::cerr << "Failed to init per-core data\n";
@@ -605,6 +696,11 @@ int main()
 
     g_running = false;
     th.join();
+    if (g_pSvc)
+        g_pSvc->Release();
+    if (g_pLoc)
+        g_pLoc->Release();
+    CoUninitialize();
 
     closesocket(server_fd);
     WSACleanup();
